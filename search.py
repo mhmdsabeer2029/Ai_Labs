@@ -23,6 +23,16 @@ CONVENTIONS (mention these in the report)
   * All four algorithms are GRAPH searches: a state is never expanded twice
     (IDS: never re-entered at an equal-or-deeper level within one iteration).
   * Ties in A* are broken first-in-first-out (a counter), so runs are repeatable.
+
+OBSERVER (used by gui.py to draw the search tree; console code can ignore it)
+  Every algorithm accepts an optional `observer=None` callback and reports what it
+  does through it. With observer=None nothing changes and nothing is slowed down.
+      observer("add",    state, parent, move, depth)   state put in the frontier
+      observer("expand", state, parent, move, depth)   state popped and expanded
+      observer("goal",   state)                        goal popped (search ends)
+      observer("reset")                                IDS only: a new iteration starts
+  BFS / DFS / A* identify tree nodes by their state. IDS passes Visit objects instead
+  (see above), because the same state can occur at several places of its tree.
 """
 
 import heapq
@@ -31,6 +41,25 @@ import time
 from collections import deque
 
 from puzzles import neighbors, is_goal
+
+
+class Visit(tuple):
+    """
+    One OCCURRENCE of a state in a search tree (used by IDS when it reports to an observer).
+
+    It holds the same 9 tiles as the state, so it can be drawn like one, but it is only
+    ever equal to itself. IDS may reach the same state through different routes inside
+    one iteration; each route is a different node of the search tree, and the observer
+    must be able to tell them apart (a plain state would collapse them into one node).
+    """
+    __slots__ = ()
+    __hash__ = object.__hash__
+
+    def __eq__(self, other):
+        return self is other
+
+    def __ne__(self, other):
+        return self is not other
 
 
 # --------------------------------------------------------------------------
@@ -69,7 +98,7 @@ def _result(name, path, expanded, max_depth, t0, **extra):
 # --------------------------------------------------------------------------
 # 1. Breadth-First Search   (frontier = FIFO queue)
 # --------------------------------------------------------------------------
-def bfs(start):
+def bfs(start, observer=None):
     """
     Expands the shallowest node first, so the first time it pops the goal the
     path is the SHORTEST one (all moves cost 1). Complete and optimal.
@@ -81,6 +110,8 @@ def bfs(start):
     frontier = deque([start])
     expanded = 0
     max_depth = 0
+    if observer:
+        observer("add", start, None, None, 0)
 
     while frontier:
         state = frontier.popleft()
@@ -88,14 +119,20 @@ def bfs(start):
         max_depth = max(max_depth, d)
 
         if is_goal(state):
+            if observer:
+                observer("goal", state)
             return _result("BFS", _build_path(parent, state), expanded, max_depth, t0)
 
         expanded += 1
+        if observer:
+            observer("expand", state, *parent[state], d)
         for move, nxt in neighbors(state):
             if nxt not in parent:
                 parent[nxt] = (state, move)
                 depth[nxt] = d + 1
                 frontier.append(nxt)
+                if observer:
+                    observer("add", nxt, state, move, d + 1)
 
     return _result("BFS", None, expanded, max_depth, t0)
 
@@ -103,7 +140,7 @@ def bfs(start):
 # --------------------------------------------------------------------------
 # 2. Depth-First Search   (frontier = LIFO stack)
 # --------------------------------------------------------------------------
-def dfs(start):
+def dfs(start, observer=None):
     """
     Always goes deepest first. Complete here because the explored set makes the
     search finite, but NOT optimal: expect very long paths (often thousands of
@@ -116,6 +153,8 @@ def dfs(start):
     stack = [(start, None, None, 0)]                # (state, parent, move, depth)
     expanded = 0
     max_depth = 0
+    if observer:
+        observer("add", start, None, None, 0)
 
     while stack:
         state, prev, move, d = stack.pop()
@@ -125,12 +164,18 @@ def dfs(start):
         max_depth = max(max_depth, d)
 
         if is_goal(state):
+            if observer:
+                observer("goal", state)
             return _result("DFS", _build_path(explored, state), expanded, max_depth, t0)
 
         expanded += 1
+        if observer:
+            observer("expand", state, prev, move, d)
         for mv, nxt in reversed(neighbors(state)):
             if nxt not in explored:
                 stack.append((nxt, state, mv, d + 1))
+                if observer:
+                    observer("add", nxt, state, mv, d + 1)
 
     return _result("DFS", None, expanded, max_depth, t0)
 
@@ -138,7 +183,7 @@ def dfs(start):
 # --------------------------------------------------------------------------
 # 3. Iterative-Deepening DFS
 # --------------------------------------------------------------------------
-def ids(start, max_limit=31):
+def ids(start, max_limit=31, observer=None):
     """
     Runs depth-limited DFS with limit = 0, 1, 2, ... until the goal is found.
     Optimal like BFS, but memory is only O(depth). Upper layers are re-expanded
@@ -156,20 +201,34 @@ def ids(start, max_limit=31):
     expanded = 0
     max_depth = 0
 
-    def dls(state, move, depth, limit, best, path):
+    def dls(state, node, parent_node, move, depth, limit, best, path):
+        # `node` / `parent_node` are Visit objects (or None when nobody is observing)
         nonlocal expanded, max_depth
         path.append((move, state))
         max_depth = max(max_depth, depth)
 
         if is_goal(state):
+            if observer:
+                observer("goal", node)
             return True
 
         if depth < limit:                           # at the limit: cut off, don't expand
             expanded += 1
-            for mv, nxt in neighbors(state):
+            if observer:
+                observer("expand", node, parent_node, move, depth)
+            # Children worth entering, decided now so they can all be announced at once
+            # (a real frontier). `best` only ever decreases, so a child that fails this
+            # test can never pass it later, and one that passes is re-checked below.
+            kids = [(mv, nxt) for mv, nxt in neighbors(state)
+                    if best.get(nxt, float("inf")) > depth + 1]
+            visits = [Visit(nxt) for _, nxt in kids] if observer else [None] * len(kids)
+            if observer:
+                for (mv, _), visit in zip(kids, visits):
+                    observer("add", visit, node, mv, depth + 1)
+            for (mv, nxt), visit in zip(kids, visits):
                 if best.get(nxt, float("inf")) > depth + 1:
                     best[nxt] = depth + 1
-                    if dls(nxt, mv, depth + 1, limit, best, path):
+                    if dls(nxt, visit, node, mv, depth + 1, limit, best, path):
                         return True
 
         path.pop()
@@ -177,7 +236,11 @@ def ids(start, max_limit=31):
 
     for limit in range(max_limit + 1):
         path = []
-        if dls(start, None, 0, limit, {start: 0}, path):
+        root = Visit(start) if observer else None
+        if observer:
+            observer("reset")                       # new iteration = new tree
+            observer("add", root, None, None, 0)
+        if dls(start, root, None, None, 0, limit, {start: 0}, path):
             return _result("IDS", path, expanded, max_depth, t0, iterations=limit + 1)
 
     return _result("IDS", None, expanded, max_depth, t0, iterations=max_limit + 1)
@@ -186,7 +249,7 @@ def ids(start, max_limit=31):
 # --------------------------------------------------------------------------
 # 4. A*   (frontier = priority queue ordered by f = g + h)
 # --------------------------------------------------------------------------
-def astar(start, h, name="A*"):
+def astar(start, h, name="A*", observer=None):
     """
     h is a heuristic function state -> number (see heuristics.py).
     Optimal when h is admissible; because Manhattan and Euclidean are also
@@ -205,6 +268,8 @@ def astar(start, h, name="A*"):
     closed = set()
     expanded = 0
     max_depth = 0
+    if observer:
+        observer("add", start, None, None, 0)
 
     while heap:
         _, _, g, state = heapq.heappop(heap)
@@ -214,9 +279,13 @@ def astar(start, h, name="A*"):
         max_depth = max(max_depth, g)
 
         if is_goal(state):
+            if observer:
+                observer("goal", state)
             return _result(name, _build_path(parent, state), expanded, max_depth, t0)
 
         expanded += 1
+        if observer:
+            observer("expand", state, *parent[state], g)
         for move, nxt in neighbors(state):
             if nxt in closed:
                 continue
@@ -225,6 +294,8 @@ def astar(start, h, name="A*"):
                 g_best[nxt] = new_g
                 parent[nxt] = (state, move)
                 heapq.heappush(heap, (new_g + h(nxt), next(counter), new_g, nxt))
+                if observer:
+                    observer("add", nxt, state, move, new_g)
 
     return _result(name, None, expanded, max_depth, t0)
 

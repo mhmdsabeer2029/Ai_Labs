@@ -142,7 +142,7 @@ def is_valid(state):
     """True if state is a tuple holding each of 0..8 exactly once."""
     return (isinstance(state, tuple)
             and len(state) == SIZE * SIZE
-            and sorted(state) == list(range(SIZE * SIZE)))
+            and sorted(state) == tuple(list(range(SIZE * SIZE))))
 
 
 def parse_state(text):
