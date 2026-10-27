@@ -1,261 +1,296 @@
 """
-search.py  --  BFS, DFS, Iterative-Deepening DFS and A* for the 8-puzzle.
+main.py  --  Entry point of the 8-puzzle solver (the "glue" file). (NOT search.py lol)
 
-The algorithms talk to the puzzle ONLY through puzzles.py (neighbors, is_goal)
-and, for A*, through a heuristic function passed in from heuristics.py.
+This file contains NO search logic and NO puzzle rules. It only:
+    1. picks a start state (random, or given by the user)
+    2. refuses unsolvable boards (puzzles.is_solvable)
+    3. runs the chosen algorithms from search.py
+    4. shows the results in a TRACEABLE format (every step drawn as a board)
+    5. prints a comparison table + the Manhattan-vs-Euclidean comparison
 
-EVERY algorithm returns the same dict, so main.py can print/compare them alike:
+USAGE
+-----
+    python main.py                          random solvable start, all algorithms
+    python main.py --seed 7                 same random start every time (for the report)
+    python main.py --state 1,2,5,3,4,0,6,7,8
+    python main.py --algo bfs astar-manhattan
+    python main.py --trace full > run.txt   print EVERY step of EVERY path to a file
+    python main.py --trace none             metrics + tables only
+    python main.py --gui                    hand the results to gui.py (when it exists)
 
-    {
-      "algorithm"      : str,
-      "solved"         : bool,
-      "path"           : [(move, state), ...]  first item is (None, start); None if unsolved
-      "cost"           : int   number of moves in the path (None if unsolved)
-      "nodes_expanded" : int   states popped from the frontier whose neighbors were generated
-      "max_depth"      : int   deepest tree level reached by the search
-      "time"           : float seconds (wall clock, perf_counter)
-    }
-
-CONVENTIONS 
-  * Neighbor order is Up, Down, Left, Right (from puzzles.MOVES).
-  * Goal test happens when a node is POPPED, not when generated. The goal node
-    itself is not counted as "expanded".
-  * All four algorithms are GRAPH searches: a state is never expanded twice
-    (IDS: never re-entered at an equal-or-deeper level within one iteration).
-  * Ties in A* are broken first-in-first-out (a counter), so runs are repeatable.
+WHY A TRACE MODE?
+    DFS finds very long paths (thousands of moves on hard boards). Drawing every
+    board of those would flood the terminal, so by default long paths show their
+    first and last boards and say how many were skipped.  --trace full prints
+    everything, which is what the assignment's "every step printed" asks for.
 """
 
-import heapq
-import itertools
-import time
-from collections import deque
+import argparse
+import random
+import sys
+import textwrap
 
-from puzzles import neighbors, is_goal
-
+from puzzles import (GOAL, SIZE, parse_state, random_state, is_solvable,
+                     count_inversions)
+from heuristics import HEURISTICS
+from search import bfs, dfs, ids, astar, validate_path
 
 # --------------------------------------------------------------------------
-# Shared helpers
+# Algorithm registry:  key (used on the command line) -> function(start) -> result
 # --------------------------------------------------------------------------
-def _build_path(parent, state):
+def _astar_runner(h, label):
+    """Wrap astar() so it has the same one-argument shape as bfs/dfs/ids."""
+    def run(start):
+        return astar(start, h, label)
+    return run
+
+
+ALGORITHMS = {"bfs": bfs, "dfs": dfs, "ids": ids}
+for _name, _h in HEURISTICS.items():            # adds astar-manhattan, astar-euclidean
+    ALGORITHMS[f"astar-{_name}"] = _astar_runner(_h, f"A* ({_name.capitalize()})")
+
+# --------------------------------------------------------------------------
+# Drawing boards
+# --------------------------------------------------------------------------
+BOARD_W = 4 * SIZE + 1          # width of one drawn board (13 for 3x3)
+PER_ROW = 5                     # boards per line: 5*13 + 4*3 gaps = 77 columns
+AUTO_FULL_LIMIT = 30            # --trace auto prints every step up to this many moves
+TRACE_EDGE = 10                 # when eliding: boards kept at each end
+
+
+def board_lines(state):
     """
-    Walk parent pointers back to the root.
-    parent maps state -> (parent_state, move); the root maps to (None, None).
-    Returns [(None, start), (move1, s1), ..., (moveN, goal)].
+    One board as a list of text lines:
+
+        ┌───┬───┬───┐
+        │ 1 │ 2 │ 5 │
+        ├───┼───┼───┤
+        │ 3 │ 4 │   │      (the blank is drawn empty)
+        ├───┼───┼───┤
+        │ 6 │ 7 │ 8 │
+        └───┴───┴───┘
     """
-    path = []
-    while state is not None:
-        prev, move = parent[state]
-        path.append((move, state))
-        state = prev
-    path.reverse()
-    return path
+    seg = "───"
+    lines = ["┌" + "┬".join([seg] * SIZE) + "┐"]
+    for r in range(SIZE):
+        row = state[r * SIZE:(r + 1) * SIZE]
+        cells = " │ ".join(" " if t == 0 else str(t) for t in row)
+        lines.append("│ " + cells + " │")
+        lines.append(("├" + "┼".join([seg] * SIZE) + "┤") if r < SIZE - 1
+                     else ("└" + "┴".join([seg] * SIZE) + "┘"))
+    return lines
 
 
-def _result(name, path, expanded, max_depth, t0, **extra):
-    """Pack the standard result dict (plus any algorithm-specific extras)."""
-    out = {
-        "algorithm": name,
-        "solved": path is not None,
-        "path": path,
-        "cost": len(path) - 1 if path is not None else None,
-        "nodes_expanded": expanded,
-        "max_depth": max_depth,
-        "time": time.perf_counter() - t0,
-    }
-    out.update(extra)
-    return out
-
-
-# --------------------------------------------------------------------------
-# 1. Breadth-First Search   (frontier = FIFO queue)
-# --------------------------------------------------------------------------
-def bfs(start):
+def print_board_row(entries):
     """
-    Expands the shallowest node first, so the first time it pops the goal the
-    path is the SHORTEST one (all moves cost 1). Complete and optimal.
-    `parent` doubles as the visited set (a state is marked when first generated).
+    Draw several boards side by side, with an arrow between neighbours.
+    entries = [(label, state), ...]   (at most PER_ROW of them)
     """
-    t0 = time.perf_counter()
-    parent = {start: (None, None)}
-    depth = {start: 0}
-    frontier = deque([start])
-    expanded = 0
-    max_depth = 0
+    blocks = [board_lines(state) for _, state in entries]
+    middle = len(blocks[0]) // 2                     # the line that gets the arrow
+    print("   ".join(label.center(BOARD_W) for label, _ in entries).rstrip())
+    for i in range(len(blocks[0])):
+        gap = " → " if i == middle else "   "
+        print(gap.join(block[i] for block in blocks))
 
-    while frontier:
-        state = frontier.popleft()
-        d = depth[state]
-        max_depth = max(max_depth, d)
 
-        if is_goal(state):
-            return _result("BFS", _build_path(parent, state), expanded, max_depth, t0)
+def print_boards(entries):
+    """Print any number of boards, PER_ROW per line."""
+    for i in range(0, len(entries), PER_ROW):
+        print_board_row(entries[i:i + PER_ROW])
+        print()
 
-        expanded += 1
-        for move, nxt in neighbors(state):
-            if nxt not in parent:
-                parent[nxt] = (state, move)
-                depth[nxt] = d + 1
-                frontier.append(nxt)
 
-    return _result("BFS", None, expanded, max_depth, t0)
+def resolve_trace_mode(mode, steps):
+    """'auto' means: everything for short paths, elided for long ones."""
+    if mode == "auto":
+        return "full" if steps <= AUTO_FULL_LIMIT else "elided"
+    return mode
+
+
+def print_trace(path, mode):
+    """Draw the solution path: a labelled board for every step."""
+    steps = len(path) - 1
+    mode = resolve_trace_mode(mode, steps)
+    if mode == "none":
+        return
+    entries = [(f"#{i} start" if move is None else f"#{i} {move}", state)
+               for i, (move, state) in enumerate(path)]
+    if mode == "elided" and len(entries) > 2 * TRACE_EDGE:
+        skipped = len(entries) - 2 * TRACE_EDGE
+        print_boards(entries[:TRACE_EDGE])
+        print(f"   ... {skipped:,} steps not drawn (use --trace full to draw all) ...\n")
+        print_boards(entries[-TRACE_EDGE:])
+    else:
+        print_boards(entries)
+
+
+def moves_text(path, mode):
+    """The move sequence as text:  Up → Left → Left  (elided if very long)."""
+    moves = [m for m, _ in path[1:]]
+    if not moves:
+        return "(none - already at the goal)"
+    if resolve_trace_mode(mode, len(moves)) == "elided" and len(moves) > 40:
+        head, tail = " → ".join(moves[:20]), " → ".join(moves[-10:])
+        return f"{head} → ... ({len(moves) - 30:,} moves not shown) ... → {tail}"
+    return " → ".join(moves)
 
 
 # --------------------------------------------------------------------------
-# 2. Depth-First Search   (frontier = LIFO stack)
+# Reporting
 # --------------------------------------------------------------------------
-def dfs(start):
+def print_result(r, trace_mode):
+    """Everything the assignment's report needs for ONE algorithm run."""
+    print("═" * 78)
+    print(f"  {r['algorithm']}")
+    print("═" * 78)
+    if not r["solved"]:
+        print("  No solution found.")
+        print(f"  Nodes expanded : {r['nodes_expanded']:,}")
+        print(f"  Running time   : {r['time']:.5f} s\n")
+        return
+
+    print(f"  Path cost      : {r['cost']:,} moves")
+    print(f"  Nodes expanded : {r['nodes_expanded']:,}")
+    print(f"  Search depth   : {r['max_depth']:,}")
+    if "iterations" in r:                                  # IDS only
+        print(f"  Iterations     : {r['iterations']}  (depth limits 0..{r['iterations'] - 1})")
+    print(f"  Running time   : {r['time']:.5f} s")
+    print(f"  Path verified  : {'yes' if r['verified'] else 'NO - INVALID PATH!'}")
+    print("  Moves          :")
+    print(textwrap.indent(textwrap.fill(moves_text(r["path"], trace_mode), 72), "    "))
+    print()
+    print_trace(r["path"], trace_mode)
+
+
+def print_summary(results):
+    """One table comparing every algorithm that ran."""
+    print("═" * 78)
+    print("  SUMMARY")
+    print("═" * 78)
+    print(f"  {'algorithm':<16}{'solved':>7}{'cost':>8}{'expanded':>11}"
+          f"{'search depth':>14}{'time (s)':>11}{'verified':>10}")
+    print("  " + "─" * 77)
+    for r in results:
+        if r["solved"]:
+            cost, verified = f"{r['cost']:,}", "yes" if r["verified"] else "NO"
+        else:
+            cost, verified = "-", "-"
+        print(f"  {r['algorithm']:<16}{'yes' if r['solved'] else 'no':>7}{cost:>8}"
+              f"{r['nodes_expanded']:>11,}{r['max_depth']:>14,}{r['time']:>11.5f}{verified:>10}")
+    print()
+
+
+def print_heuristic_comparison(by_key):
+    """The comparison the assignment asks for: Manhattan vs Euclidean inside A*."""
+    m, e = by_key.get("astar-manhattan"), by_key.get("astar-euclidean")
+    if not (m and e and m["solved"] and e["solved"]):
+        return
+    print("  A* HEURISTIC COMPARISON")
+    print("  " + "─" * 77)
+    print(f"  Manhattan : expanded {m['nodes_expanded']:,} nodes, path cost {m['cost']}")
+    print(f"  Euclidean : expanded {e['nodes_expanded']:,} nodes, path cost {e['cost']}")
+    if m["nodes_expanded"] < e["nodes_expanded"]:
+        print(f"  -> Manhattan expanded fewer nodes "
+              f"(Euclidean needed {e['nodes_expanded'] / m['nodes_expanded']:.2f}x as many).")
+    elif m["nodes_expanded"] > e["nodes_expanded"]:
+        print("  -> Euclidean expanded fewer nodes on this board.")
+    else:
+        print("  -> Both expanded the same number of nodes on this board.")
+    if m["cost"] == e["cost"]:
+        same = "identical" if m["path"] == e["path"] else "different"
+        print(f"  -> Both paths cost {m['cost']}; the move sequences are {same}.")
+    else:
+        print("  -> The path costs differ.")
+    print()
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        description="8-puzzle solver: BFS, DFS, Iterative-Deepening DFS and A*.")
+    p.add_argument("-s", "--state", metavar="TILES",
+                   help='start board row by row, 0 = blank, e.g. "1,2,5,3,4,0,6,7,8" '
+                        "(default: a random solvable board)")
+    p.add_argument("--seed", type=int,
+                   help="seed for the random start board, so a run can be repeated")
+    p.add_argument("-a", "--algo", nargs="+", default=["all"],
+                   choices=["all"] + list(ALGORITHMS), metavar="ALGO",
+                   help="which algorithms to run: all, " + ", ".join(ALGORITHMS)
+                        + "  (default: all)")
+    p.add_argument("--trace", choices=["auto", "full", "none"], default="auto",
+                   help="how many solution steps to draw: auto = every step for short "
+                        "paths, first/last boards for long ones (default); "
+                        "full = every step; none = metrics only")
+    p.add_argument("--gui", action="store_true",
+                   help="after solving, open gui.py to animate the results")
+    return p.parse_args(argv)
+
+
+def force_utf8():
     """
-    Always goes deepest first. Complete here because the explored set makes the
-    search finite, but NOT optimal: expect very long paths (often thousands of
-    moves). A state is marked explored when POPPED, so the stack may briefly hold
-    duplicates; each stack entry remembers its own parent and move.
-    Neighbors are pushed in reverse so Up is tried first.
+    The boards use box-drawing characters. When output is redirected to a file on
+    Windows, Python may pick a legacy encoding that cannot store them and crash.
     """
-    t0 = time.perf_counter()
-    explored = {}                                   # state -> (parent, move)
-    stack = [(start, None, None, 0)]                # (state, parent, move, depth)
-    expanded = 0
-    max_depth = 0
-
-    while stack:
-        state, prev, move, d = stack.pop()
-        if state in explored:
-            continue
-        explored[state] = (prev, move)
-        max_depth = max(max_depth, d)
-
-        if is_goal(state):
-            return _result("DFS", _build_path(explored, state), expanded, max_depth, t0)
-
-        expanded += 1
-        for mv, nxt in reversed(neighbors(state)):
-            if nxt not in explored:
-                stack.append((nxt, state, mv, d + 1))
-
-    return _result("DFS", None, expanded, max_depth, t0)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
 
 
-# --------------------------------------------------------------------------
-# 3. Iterative-Deepening DFS
-# --------------------------------------------------------------------------
-def ids(start, max_limit=31):
-    """
-    Runs depth-limited DFS with limit = 0, 1, 2, ... until the goal is found.
-    Optimal like BFS, but memory is only O(depth). Upper layers are re-expanded
-    every iteration, so nodes_expanded counts ALL iterations together.
+def main(argv=None):
+    force_utf8()
+    args = parse_args(argv)
 
-    Cycle control: within one iteration a state is entered only if it has not
-    been seen at an equal or shallower depth (`best`). A plain "explored" set
-    would be WRONG here: a state first reached too deep could block a shallower
-    route to it and make the search miss the solution.
+    # ---- 1. choose the start state --------------------------------------
+    if args.state:
+        try:
+            start = parse_state(args.state)
+        except ValueError as err:
+            print(f"Invalid --state: {err}", file=sys.stderr)
+            return 2
+        origin = "given"
+    else:
+        seed = args.seed if args.seed is not None else random.randrange(1_000_000)
+        random.seed(seed)
+        start = random_state()
+        origin = f"random, seed {seed}"
 
-    max_limit=31 is the longest optimal solution of any 8-puzzle, so solvable
-    states are always found and unsolvable ones terminate instead of looping.
-    """
-    t0 = time.perf_counter()
-    expanded = 0
-    max_depth = 0
+    # ---- 2. solvability check (BFS would otherwise exhaust 181,440 states) -
+    inversions = count_inversions(start)
+    print("8-PUZZLE SOLVER")
+    print(f"Start state ({origin})  →  goal state\n")
+    print_board_row([("start", start), ("goal", GOAL)])
+    print()
+    if not is_solvable(start):
+        word = "inversion" if inversions == 1 else "inversions"
+        print(f"This board is NOT solvable: it has {inversions} {word} (odd), and "
+              "no sequence of moves can change that parity.")
+        print("Try another --state, or omit it to get a random solvable board.")
+        return 1
+    print(f"Solvable: yes ({inversions} inversions, even)")
+    print("Heuristic value of the start board: "
+          + ", ".join(f"{name} {h(start):.2f}" for name, h in HEURISTICS.items()))
+    print()
 
-    def dls(state, move, depth, limit, best, path):
-        nonlocal expanded, max_depth
-        path.append((move, state))
-        max_depth = max(max_depth, depth)
+    # ---- 3. run the algorithms -----------------------------------------
+    keys = list(ALGORITHMS) if "all" in args.algo else list(dict.fromkeys(args.algo))
+    by_key = {}
+    for key in keys:
+        result = ALGORITHMS[key](start)
+        result["verified"] = validate_path(start, result["path"])   # replay every move
+        by_key[key] = result
+        print_result(result, args.trace)
 
-        if is_goal(state):
-            return True
+    # ---- 4. comparison ---------------------------------------------------
+    results = list(by_key.values())
+    print_summary(results)
+    print_heuristic_comparison(by_key)
 
-        if depth < limit:                           # at the limit: cut off, don't expand
-            expanded += 1
-            for mv, nxt in neighbors(state):
-                if best.get(nxt, float("inf")) > depth + 1:
-                    best[nxt] = depth + 1
-                    if dls(nxt, mv, depth + 1, limit, best, path):
-                        return True
-
-        path.pop()
-        return False
-
-    for limit in range(max_limit + 1):
-        path = []
-        if dls(start, None, 0, limit, {start: 0}, path):
-            return _result("IDS", path, expanded, max_depth, t0, iterations=limit + 1)
-
-    return _result("IDS", None, expanded, max_depth, t0, iterations=max_limit + 1)
-
-
-# --------------------------------------------------------------------------
-# 4. A*   (frontier = priority queue ordered by f = g + h)
-# --------------------------------------------------------------------------
-def astar(start, h, name="A*"):
-    """
-    h is a heuristic function state -> number (see heuristics.py).
-    Optimal when h is admissible; because Manhattan and Euclidean are also
-    consistent, closing a state on its first pop is safe.
-
-    Heap entries are (f, tie_counter, g, state); the counter keeps ties FIFO
-    and stops Python from ever comparing two states.
-    A state can be pushed more than once (cheaper route found later); stale
-    entries are skipped when popped because the state is already closed.
-    """
-    t0 = time.perf_counter()
-    counter = itertools.count()
-    parent = {start: (None, None)}
-    g_best = {start: 0}
-    heap = [(h(start), next(counter), 0, start)]
-    closed = set()
-    expanded = 0
-    max_depth = 0
-
-    while heap:
-        _, _, g, state = heapq.heappop(heap)
-        if state in closed:
-            continue
-        closed.add(state)
-        max_depth = max(max_depth, g)
-
-        if is_goal(state):
-            return _result(name, _build_path(parent, state), expanded, max_depth, t0)
-
-        expanded += 1
-        for move, nxt in neighbors(state):
-            if nxt in closed:
-                continue
-            new_g = g + 1
-            if new_g < g_best.get(nxt, float("inf")):
-                g_best[nxt] = new_g
-                parent[nxt] = (state, move)
-                heapq.heappush(heap, (new_g + h(nxt), next(counter), new_g, nxt))
-
-    return _result(name, None, expanded, max_depth, t0)
-
-
-# --------------------------------------------------------------------------
-# Quick self-test:  python search.py
-# --------------------------------------------------------------------------
-def validate_path(start, path):
-    """Replay a path move by move; True if every step is legal and it ends at GOAL."""
-    if path is None or path[0] != (None, start):
-        return False
-    for (_, prev), (move, cur) in zip(path, path[1:]):
-        if (move, cur) not in neighbors(prev):
-            return False
-    return is_goal(path[-1][1])
 
 
 if __name__ == "__main__":
-    from puzzles import parse_state
-    from heuristics import manhattan, euclidean
-
-    start = parse_state("1,2,5,3,4,0,6,7,8")          # example from the assignment PDF
-    runs = [
-        bfs(start),
-        dfs(start),
-        ids(start),
-        astar(start, manhattan, "A* (Manhattan)"),
-        astar(start, euclidean, "A* (Euclidean)"),
-    ]
-    print(f"{'algorithm':<16}{'cost':>6}{'expanded':>10}{'max depth':>11}{'time (s)':>11}  valid")
-    for r in runs:
-        ok = validate_path(start, r["path"])
-        print(f"{r['algorithm']:<16}{r['cost']:>6}{r['nodes_expanded']:>10}"
-              f"{r['max_depth']:>11}{r['time']:>11.5f}  {ok}")
+    sys.exit(main())
